@@ -4,11 +4,13 @@ import {
   ChevronDown, ChevronUp, RotateCcw, Download, Plus,
   Radio, Wifi, WifiOff, Eye, EyeOff, ArrowUp, ArrowDown,
   ClipboardPaste, FileUp, Newspaper, AlertCircle, CheckCircle2,
-  Type, History, Trash2, Undo2, Tags
+  Type, History, Trash2, Undo2, Tags, Sparkles
 } from 'lucide-react';
 import type { Story, StorySource, ValidationIssue, TickerOption, TickerResult } from './types';
 import { countWords, MAX_WORDS } from './utils/wordCount';
 import { buildExportPayload, downloadJson, getExportableCount } from './utils/exportJson';
+import { DEFAULT_CATEGORIES } from './utils/categories';
+import { extractPdfText } from './utils/pdfExtract';
 import { SAMPLE_ANNOUNCEMENTS, createStoryFromSource, generateId } from './utils/sampleData';
 import { checkHealth, generateTickers } from './services/api';
 import { loadSession, saveSession, clearSession } from './utils/persistence';
@@ -359,6 +361,12 @@ function StoryCard({
               <AlertCircle size={16} className="mt-0.5 shrink-0" />
               <span>{story.error || 'Generation failed. Click retry to try again.'}</span>
             </div>
+            <button
+              onClick={() => onRegenerate(story.sourceId)}
+              className="mt-3 text-sm px-4 py-2 bg-accent text-white font-medium rounded hover:bg-accent-hover transition-fast flex items-center gap-2"
+            >
+              <RotateCcw size={14} /> Retry Generation
+            </button>
           </div>
         ) : (
           <>
@@ -377,32 +385,44 @@ function StoryCard({
                 wordCount={story.wordCount}
               />
               <div className="flex items-center gap-1.5">
-                <button
-                  onClick={() => onUndo(story.sourceId)}
-                  disabled={!canUndo}
-                  className="p-1.5 rounded text-secondary hover:text-ink hover:bg-muted transition-fast disabled:opacity-30 disabled:cursor-not-allowed"
-                  title={canUndo
-                    ? `Undo — restore previous text: "${story.editHistory[story.editHistory.length - 1].text.slice(0, 40)}${story.editHistory[story.editHistory.length - 1].text.length > 40 ? '…' : ''}"`
-                    : 'Nothing to undo'}
-                >
-                  <Undo2 size={13} />
-                </button>
-                <button
-                  onClick={() => onRevert(story.sourceId)}
-                  disabled={!canRevert}
-                  className="text-xs px-2.5 py-1.5 rounded text-secondary hover:text-ink hover:bg-muted transition-fast flex items-center gap-1 disabled:opacity-30 disabled:cursor-not-allowed"
-                  title="Revert to the last generated text"
-                >
-                  <RotateCcw size={12} /> Revert
-                </button>
-                <button
-                  onClick={() => onRegenerate(story.sourceId)}
-                  disabled={isGenerating}
-                  className="text-xs px-2.5 py-1.5 rounded text-secondary hover:text-ink hover:bg-muted transition-fast flex items-center gap-1 disabled:opacity-40"
-                  title="Regenerate ticker"
-                >
-                  <RotateCcw size={12} /> Retry
-                </button>
+                {!hasTicker ? (
+                  <button
+                    onClick={() => onRegenerate(story.sourceId)}
+                    className="text-xs px-3 py-1.5 rounded bg-accent text-white font-medium hover:bg-accent-hover transition-fast flex items-center gap-1.5"
+                    title="Generate a ticker for this announcement"
+                  >
+                    <Sparkles size={12} /> Generate Ticker
+                  </button>
+                ) : (
+                  <>
+                    <button
+                      onClick={() => onUndo(story.sourceId)}
+                      disabled={!canUndo}
+                      className="p-1.5 rounded text-secondary hover:text-ink hover:bg-muted transition-fast disabled:opacity-30 disabled:cursor-not-allowed"
+                      title={canUndo
+                        ? `Undo — restore previous text: "${story.editHistory[story.editHistory.length - 1].text.slice(0, 40)}${story.editHistory[story.editHistory.length - 1].text.length > 40 ? '…' : ''}"`
+                        : 'Nothing to undo'}
+                    >
+                      <Undo2 size={13} />
+                    </button>
+                    <button
+                      onClick={() => onRevert(story.sourceId)}
+                      disabled={!canRevert}
+                      className="text-xs px-2.5 py-1.5 rounded text-secondary hover:text-ink hover:bg-muted transition-fast flex items-center gap-1 disabled:opacity-30 disabled:cursor-not-allowed"
+                      title="Revert to the last generated text"
+                    >
+                      <RotateCcw size={12} /> Revert
+                    </button>
+                    <button
+                      onClick={() => onRegenerate(story.sourceId)}
+                      disabled={isGenerating}
+                      className="text-xs px-2.5 py-1.5 rounded text-secondary hover:text-ink hover:bg-muted transition-fast flex items-center gap-1 disabled:opacity-40"
+                      title="Generate another ticker option for this announcement"
+                    >
+                      <RotateCcw size={12} /> Regenerate
+                    </button>
+                  </>
+                )}
                 {story.isApproved ? (
                   <button
                     onClick={() => onReject(story.sourceId)}
@@ -604,7 +624,19 @@ function BatchImporter({
   const [title, setTitle] = useState('');
   const [category, setCategory] = useState('');
   const [error, setError] = useState('');
+  const [extracting, setExtracting] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  /** TXT / PDF text → StorySources (splits on the delimiter, or single story). */
+  const importAnnouncementText = (content: string) => {
+    const parts = content.includes('--- ANNOUNCEMENT ---')
+      ? content.split('--- ANNOUNCEMENT ---').map(p => p.trim()).filter(Boolean)
+      : [content.trim()];
+    onImport(parts.map(c => ({
+      sourceId: generateId(),
+      sourceContent: c,
+    })));
+  };
 
   const handleSubmit = () => {
     setError('');
@@ -629,10 +661,30 @@ function BatchImporter({
     }
   };
 
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     setError('');
     const file = e.target.files?.[0];
     if (!file) return;
+    // Allow re-uploading the same file later
+    e.target.value = '';
+
+    // PDF — extract text client-side, then import like TXT
+    if (file.name.toLowerCase().endsWith('.pdf')) {
+      setExtracting(true);
+      try {
+        const content = await extractPdfText(file);
+        if (!content.trim()) {
+          setError('No readable text found in the PDF (it may be a scanned image).');
+          return;
+        }
+        importAnnouncementText(content);
+      } catch {
+        setError('Failed to extract text from the PDF.');
+      } finally {
+        setExtracting(false);
+      }
+      return;
+    }
 
     const reader = new FileReader();
     reader.onload = (ev) => {
@@ -670,14 +722,7 @@ function BatchImporter({
         }
       } else {
         // TXT file — split by delimiter or treat as single
-        const parts = content.includes('--- ANNOUNCEMENT ---')
-          ? content.split('--- ANNOUNCEMENT ---').map(p => p.trim()).filter(Boolean)
-          : [content.trim()];
-
-        onImport(parts.map(c => ({
-          sourceId: generateId(),
-          sourceContent: c,
-        })));
+        importAnnouncementText(content);
       }
     };
     reader.onerror = () => setError('Failed to read file.');
@@ -721,16 +766,18 @@ function BatchImporter({
               <div className="border-2 border-dashed border-muted rounded-lg p-8 text-center hover:border-accent/40 transition-fast">
                 <Upload size={32} className="mx-auto text-secondary mb-3" />
                 <p className="text-sm text-secondary mb-3">
-                  Upload a <strong>.txt</strong> or <strong>.csv</strong> file
+                  Upload a <strong>.txt</strong>, <strong>.csv</strong> or <strong>.pdf</strong> file
                 </p>
-                <label className="inline-block px-4 py-2 bg-accent text-white text-sm font-medium rounded hover:bg-accent-hover transition-fast cursor-pointer">
-                  Choose File
-                  <input ref={fileInputRef} type="file" accept=".txt,.csv" onChange={handleFileUpload} className="hidden" />
+                <label className={`inline-block px-4 py-2 bg-accent text-white text-sm font-medium rounded hover:bg-accent-hover transition-fast cursor-pointer ${extracting ? 'opacity-60 pointer-events-none' : ''}`}>
+                  {extracting ? 'Extracting text…' : 'Choose File'}
+                  {extracting && <Loader2 size={13} className="inline ml-2 animate-spin" />}
+                  <input ref={fileInputRef} type="file" accept=".txt,.csv,.pdf" onChange={handleFileUpload} className="hidden" disabled={extracting} />
                 </label>
               </div>
               <div className="text-xs text-secondary space-y-1">
                 <p><strong>TXT:</strong> Use <code className="font-mono bg-muted px-1 rounded">--- ANNOUNCEMENT ---</code> between stories, or import as single story.</p>
                 <p><strong>CSV:</strong> Header row: <code className="font-mono bg-muted px-1 rounded">title,content,category</code></p>
+                <p><strong>PDF:</strong> Text is extracted automatically; use the same delimiter between stories, or import as single story.</p>
               </div>
             </div>
           ) : (
@@ -749,6 +796,7 @@ function BatchImporter({
                     value={category}
                     onChange={e => setCategory(e.target.value)}
                     placeholder="Category (optional)"
+                    list="category-suggestions"
                     className="col-span-1 text-sm px-3 py-2 border border-muted rounded bg-surface focus:border-accent outline-none transition-fast font-malayalam"
                   />
                 </div>
@@ -768,11 +816,19 @@ function BatchImporter({
                   value={category}
                   onChange={e => setCategory(e.target.value)}
                   placeholder="Category for all (optional)"
+                  list="category-suggestions"
                   className="w-full text-sm px-3 py-2 border border-muted rounded bg-surface focus:border-accent outline-none transition-fast"
                 />
               )}
             </div>
           )}
+
+          {/* Category suggestions — editors can still type their own */}
+          <datalist id="category-suggestions">
+            {DEFAULT_CATEGORIES.map(cat => (
+              <option key={cat} value={cat} />
+            ))}
+          </datalist>
 
           {error && (
             <div className="mt-3 text-sm text-error bg-error/5 px-3 py-2 rounded flex items-start gap-2">
