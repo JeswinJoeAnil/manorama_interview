@@ -4,13 +4,37 @@ import {
   ChevronDown, ChevronUp, RotateCcw, Download, Plus,
   Radio, Wifi, WifiOff, Eye, EyeOff, ArrowUp, ArrowDown,
   ClipboardPaste, FileUp, Newspaper, AlertCircle, CheckCircle2,
-  Type
+  Type, History, Trash2, Undo2, Tags
 } from 'lucide-react';
-import type { Story, ValidationIssue } from './types';
+import type { Story, StorySource, ValidationIssue, TickerOption, TickerResult } from './types';
 import { countWords, MAX_WORDS } from './utils/wordCount';
 import { buildExportPayload, downloadJson, getExportableCount } from './utils/exportJson';
 import { SAMPLE_ANNOUNCEMENTS, createStoryFromSource, generateId } from './utils/sampleData';
 import { checkHealth, generateTickers } from './services/api';
+import { loadSession, saveSession, clearSession } from './utils/persistence';
+
+// ── History / options limits ────────────────────────────────────────────────
+
+const MAX_EDIT_HISTORY = 20;
+const MAX_OPTIONS = 10;
+
+const QUICK_TAGS = ['High', 'Medium', 'Low', 'Follow-up'];
+
+// ── Shared ticker-text evaluation ───────────────────────────────────────────
+
+function evaluateTickerText(text: string): {
+  wordCount: number;
+  validationIssues: ValidationIssue[];
+  isValid: boolean;
+} {
+  const wc = countWords(text);
+  const isOverLimit = wc > MAX_WORDS;
+  const isEmpty = !text.trim();
+  const validationIssues: ValidationIssue[] = [];
+  if (isEmpty) validationIssues.push({ type: 'error', code: 'EMPTY_TICKER', message: 'Ticker text is empty.' });
+  if (isOverLimit) validationIssues.push({ type: 'error', code: 'WORD_COUNT_EXCEEDED', message: `Ticker has ${wc} words (maximum is ${MAX_WORDS}).` });
+  return { wordCount: wc, validationIssues, isValid: !isEmpty && !isOverLimit };
+}
 
 // ── Toast Component ─────────────────────────────────────────────────────────
 
@@ -70,6 +94,141 @@ function ValidationBadge({ issues, isValid, wordCount }: { issues: ValidationIss
   );
 }
 
+// ── Ticker option helpers ────────────────────────────────────────────────────
+
+/** Snapshot a story's current ticker as a selectable option so nothing is lost on regenerate. */
+function snapshotOption(sourceId: string, s: Story, version: number): TickerOption {
+  return {
+    id: `${sourceId}-opt-${version}-${Date.now()}`,
+    version,
+    text: s.tickerText,
+    wordCount: s.wordCount,
+    validationIssues: s.validationIssues,
+    isValid: s.isValid,
+    keyFact: s.keyFact,
+    reviewNote: s.reviewNote,
+    needsReview: s.needsReview,
+    isDemo: s.isDemo,
+    generatedAt: Date.now(),
+  };
+}
+
+/**
+ * Apply a successful generation result to a story, archiving the current ticker
+ * first so previously generated tickers stay available as selectable options.
+ */
+function withGeneratedTicker(s: Story, result: TickerResult): Story {
+  const currentText = s.tickerText.trim();
+  const newText = result.ticker.trim();
+
+  // Archive the current ticker (unless empty, identical to the new one, or already stored)
+  let options = s.tickerOptions;
+  if (currentText && currentText !== newText && !options.some(o => o.text.trim() === currentText)) {
+    options = [...options, snapshotOption(s.sourceId, s, s.tickerVersion)];
+  }
+
+  return {
+    ...s,
+    tickerOptions: options.slice(-MAX_OPTIONS),
+    tickerVersion: Math.max(s.tickerVersion, ...options.map(o => o.version)) + 1,
+    tickerText: result.ticker,
+    keyFact: result.key_fact,
+    reviewNote: result.review_note || undefined,
+    needsReview: result.needs_review,
+    wordCount: result.word_count,
+    validationIssues: result.validation_issues,
+    isValid: result.is_valid,
+    isDemo: result.is_demo,
+    status: 'generated' as const,
+    isApproved: false, // Never auto-approve
+    // New generation becomes the revert target; the undo stack is obsolete
+    originalTickerText: result.ticker,
+    editHistory: [],
+  };
+}
+
+// ── Tag Editor ──────────────────────────────────────────────────────────────
+
+function TagEditor({ tags, onChange }: { tags: string[]; onChange: (tags: string[]) => void }) {
+  const [input, setInput] = useState('');
+  const [open, setOpen] = useState(false);
+
+  const addTag = (raw: string) => {
+    const t = raw.trim();
+    if (!t) return;
+    if (!tags.includes(t)) onChange([...tags, t]);
+    setInput('');
+  };
+
+  const removeTag = (t: string) => onChange(tags.filter(x => x !== t));
+
+  const suggestions = QUICK_TAGS.filter(t => !tags.includes(t));
+
+  return (
+    <div className="flex flex-wrap items-center gap-1.5">
+      {tags.map(t => (
+        <span
+          key={t}
+          className="text-xs font-mono text-accent bg-accent/10 border border-accent/20 rounded px-2 py-0.5 flex items-center gap-1"
+        >
+          {t}
+          <button
+            onClick={() => removeTag(t)}
+            className="opacity-50 hover:opacity-100"
+            title={`Remove tag "${t}"`}
+          >
+            <X size={10} />
+          </button>
+        </span>
+      ))}
+      {open ? (
+        <span className="flex items-center gap-1">
+          <input
+            autoFocus
+            type="text"
+            value={input}
+            onChange={e => setInput(e.target.value)}
+            onKeyDown={e => {
+              if (e.key === 'Enter') { e.preventDefault(); addTag(input); }
+              if (e.key === 'Escape') { setOpen(false); setInput(''); }
+            }}
+            placeholder="Tag name…"
+            className="text-xs px-1.5 py-0.5 w-24 border border-muted rounded bg-surface focus:border-accent outline-none"
+          />
+          {suggestions.length > 0 && (
+            <span className="flex items-center gap-1">
+              {suggestions.map(t => (
+                <button
+                  key={t}
+                  onClick={() => addTag(t)}
+                  className="text-[10px] px-1.5 py-0.5 rounded border border-muted text-secondary hover:text-ink hover:bg-muted transition-fast"
+                >
+                  {t}
+                </button>
+              ))}
+            </span>
+          )}
+          <button
+            onClick={() => { setOpen(false); setInput(''); }}
+            className="text-secondary hover:text-ink text-xs px-0.5"
+            title="Done"
+          >
+            <X size={12} />
+          </button>
+        </span>
+      ) : (
+        <button
+          onClick={() => setOpen(true)}
+          className="text-xs text-secondary hover:text-ink flex items-center gap-1 px-1.5 py-0.5 rounded border border-dashed border-muted hover:border-accent/40 transition-fast"
+          title="Add a tag (e.g. priority or topic)"
+        >
+          <Tags size={11} /> Tag
+        </button>
+      )}
+    </div>
+  );
+}
+
 // ── Story Card ──────────────────────────────────────────────────────────────
 
 function StoryCard({
@@ -82,6 +241,11 @@ function StoryCard({
   onRegenerate,
   onMoveUp,
   onMoveDown,
+  onRestoreOption,
+  onDeleteOption,
+  onUndo,
+  onRevert,
+  onTagsChange,
 }: {
   story: Story;
   index: number;
@@ -92,13 +256,23 @@ function StoryCard({
   onRegenerate: (id: string) => void;
   onMoveUp: (id: string) => void;
   onMoveDown: (id: string) => void;
+  onRestoreOption: (sourceId: string, optionId: string) => void;
+  onDeleteOption: (sourceId: string, optionId: string) => void;
+  onUndo: (sourceId: string) => void;
+  onRevert: (sourceId: string) => void;
+  onTagsChange: (sourceId: string, tags: string[]) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [showIssues, setShowIssues] = useState(false);
+  const [showOptions, setShowOptions] = useState(false);
 
   const isGenerating = story.status === 'generating';
   const hasTicker = story.tickerText.trim().length > 0;
   const canApprove = story.isValid && hasTicker && !isGenerating;
+  const canUndo = story.editHistory.length > 0 && !isGenerating;
+  const canRevert = !!story.originalTickerText
+    && story.tickerText !== story.originalTickerText
+    && !isGenerating;
 
   return (
     <div className={`bg-surface border rounded transition-fast ${
@@ -136,16 +310,19 @@ function StoryCard({
           )}
         </div>
 
-        {/* Title / category */}
+        {/* Title / category / tags */}
         <div className="flex-1 min-w-0">
           {story.sourceTitle && (
             <span className="font-malayalam text-sm font-semibold text-ink truncate block">
               {story.sourceTitle}
             </span>
           )}
-          {story.category && (
-            <span className="font-mono text-xs text-secondary">{story.category}</span>
-          )}
+          <div className="flex flex-wrap items-center gap-2">
+            {story.category && (
+              <span className="font-mono text-xs text-secondary">{story.category}</span>
+            )}
+            <TagEditor tags={story.tags} onChange={(tags) => onTagsChange(story.sourceId, tags)} />
+          </div>
         </div>
 
         {/* Reorder buttons */}
@@ -200,6 +377,24 @@ function StoryCard({
                 wordCount={story.wordCount}
               />
               <div className="flex items-center gap-1.5">
+                <button
+                  onClick={() => onUndo(story.sourceId)}
+                  disabled={!canUndo}
+                  className="p-1.5 rounded text-secondary hover:text-ink hover:bg-muted transition-fast disabled:opacity-30 disabled:cursor-not-allowed"
+                  title={canUndo
+                    ? `Undo — restore previous text: "${story.editHistory[story.editHistory.length - 1].text.slice(0, 40)}${story.editHistory[story.editHistory.length - 1].text.length > 40 ? '…' : ''}"`
+                    : 'Nothing to undo'}
+                >
+                  <Undo2 size={13} />
+                </button>
+                <button
+                  onClick={() => onRevert(story.sourceId)}
+                  disabled={!canRevert}
+                  className="text-xs px-2.5 py-1.5 rounded text-secondary hover:text-ink hover:bg-muted transition-fast flex items-center gap-1 disabled:opacity-30 disabled:cursor-not-allowed"
+                  title="Revert to the last generated text"
+                >
+                  <RotateCcw size={12} /> Revert
+                </button>
                 <button
                   onClick={() => onRegenerate(story.sourceId)}
                   disabled={isGenerating}
@@ -259,6 +454,68 @@ function StoryCard({
                     issue.type === 'error' ? 'bg-error/5 text-error' : 'bg-warning/5 text-warning'
                   }`}>
                     <span className="font-mono font-medium">{issue.code}:</span> {issue.message}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Previously generated options */}
+        {story.tickerOptions.length > 0 && (
+          <div className="mt-3 border-t border-muted/40 pt-2">
+            <button
+              onClick={() => setShowOptions(!showOptions)}
+              className="text-xs text-secondary hover:text-ink flex items-center gap-1.5 transition-fast"
+              title="Previously generated tickers stay available so you can compare and switch"
+            >
+              <History size={12} />
+              Previously generated ({story.tickerOptions.length})
+              {showOptions ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+            </button>
+            {showOptions && (
+              <div className="mt-2 space-y-1.5">
+                {[...story.tickerOptions].reverse().map(option => (
+                  <div
+                    key={option.id}
+                    className="flex items-start gap-2 rounded border border-muted bg-muted/20 px-2.5 py-2"
+                  >
+                    <span className="font-mono text-[10px] px-1.5 py-0.5 bg-muted rounded text-secondary shrink-0 mt-0.5">
+                      V{option.version}
+                    </span>
+                    <div className="flex-1 min-w-0">
+                      <p className="font-malayalam text-xs text-ink/90 leading-snug line-clamp-2">
+                        {option.text}
+                      </p>
+                      <div className="flex items-center gap-2 mt-0.5 font-mono text-[10px] text-secondary">
+                        <span>{option.wordCount}/{MAX_WORDS}w</span>
+                        {option.isValid ? (
+                          <span className="text-success flex items-center gap-0.5"><Check size={9} /> valid</span>
+                        ) : (
+                          <span className="text-warning flex items-center gap-0.5"><AlertTriangle size={9} /> issues</span>
+                        )}
+                        {option.isDemo && <span>demo</span>}
+                        <span>{new Date(option.generatedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-0.5 shrink-0">
+                      <button
+                        onClick={() => onRestoreOption(story.sourceId, option.id)}
+                        disabled={isGenerating}
+                        className="text-xs px-2 py-1 rounded bg-accent/10 text-accent hover:bg-accent/20 transition-fast flex items-center gap-1 disabled:opacity-40"
+                        title="Use this version as the current ticker (current text stays available above)"
+                      >
+                        <Check size={11} /> Use
+                      </button>
+                      <button
+                        onClick={() => onDeleteOption(story.sourceId, option.id)}
+                        disabled={isGenerating}
+                        className="p-1 rounded text-secondary hover:text-error transition-fast disabled:opacity-40"
+                        title="Discard this option"
+                      >
+                        <Trash2 size={12} />
+                      </button>
+                    </div>
                   </div>
                 ))}
               </div>
@@ -339,7 +596,7 @@ function BatchImporter({
   onImport,
   onClose,
 }: {
-  onImport: (stories: Omit<Story, 'tickerText' | 'keyFact' | 'wordCount' | 'validationIssues' | 'isValid' | 'isApproved' | 'needsReview' | 'isDemo' | 'status' | 'editVersion'>[]) => void;
+  onImport: (stories: StorySource[]) => void;
   onClose: () => void;
 }) {
   const [mode, setMode] = useState<ImportMode>('single');
@@ -572,16 +829,22 @@ function parseCSVLine(line: string): string[] {
 // ── Main App ────────────────────────────────────────────────────────────────
 
 function App() {
-  const [stories, setStories] = useState<Story[]>([]);
-  const [batchId] = useState(() => `batch-${Date.now()}`);
+  const [initialSession] = useState(() => loadSession());
+  const [stories, setStories] = useState<Story[]>(() => initialSession?.stories ?? []);
+  const [batchId, setBatchId] = useState(() => initialSession?.batchId ?? `batch-${Date.now()}`);
   const [batchTitle] = useState('Editorial Session');
   const [isConnected, setIsConnected] = useState(false);
   const [geminiConfigured, setGeminiConfigured] = useState(false);
   const [modelName, setModelName] = useState('');
+  const [providerName, setProviderName] = useState('');
   const [showImporter, setShowImporter] = useState(false);
+  const [tagFilter, setTagFilter] = useState<string | null>(null);
   const [isGenerating, setIsGenerating] = useState(false);
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' | 'info' } | null>(null);
   const generationVersionRef = useRef<Map<string, number>>(new Map());
+
+  // Friendly label for the active AI provider shown in the status bar.
+  const providerLabel = providerName === 'gemini' ? 'Gemini' : 'AI';
 
   // Health check on mount
   useEffect(() => {
@@ -591,6 +854,7 @@ function App() {
         setIsConnected(true);
         setGeminiConfigured(health.gemini_configured);
         setModelName(health.model);
+        setProviderName(health.provider);
       } catch {
         setIsConnected(false);
       }
@@ -600,9 +864,16 @@ function App() {
     return () => clearInterval(interval);
   }, []);
 
+  // ── Session persistence (best-effort, debounced) ──────────────────────
+
+  useEffect(() => {
+    const timer = setTimeout(() => saveSession(batchId, stories), 300);
+    return () => clearTimeout(timer);
+  }, [batchId, stories]);
+
   // ── Story management ──────────────────────────────────────────────────
 
-  const addStories = useCallback((sources: Omit<Story, 'tickerText' | 'keyFact' | 'wordCount' | 'validationIssues' | 'isValid' | 'isApproved' | 'needsReview' | 'isDemo' | 'status' | 'editVersion'>[]) => {
+  const addStories = useCallback((sources: StorySource[]) => {
     const newStories = sources.map(src =>
       createStoryFromSource(src.sourceId, src.sourceContent, src.sourceTitle, src.category)
     );
@@ -622,13 +893,14 @@ function App() {
   const editTicker = useCallback((sourceId: string, text: string) => {
     setStories(prev => prev.map(s => {
       if (s.sourceId !== sourceId) return s;
-      const wc = countWords(text);
-      const isOverLimit = wc > MAX_WORDS;
-      const isEmpty = !text.trim();
-      const validationIssues: ValidationIssue[] = [];
-      if (isEmpty) validationIssues.push({ type: 'error', code: 'EMPTY_TICKER', message: 'Ticker text is empty.' });
-      if (isOverLimit) validationIssues.push({ type: 'error', code: 'WORD_COUNT_EXCEEDED', message: `Ticker has ${wc} words (maximum is ${MAX_WORDS}).` });
-      const isValid = !isEmpty && !isOverLimit;
+      const { wordCount: wc, validationIssues, isValid } = evaluateTickerText(text);
+
+      // Snapshot the pre-edit text so the editor can undo (skip no-op churn)
+      const lastSnapshot = s.editHistory[s.editHistory.length - 1];
+      const editHistory = s.tickerText.trim() && lastSnapshot?.text !== s.tickerText
+        ? [...s.editHistory, { text: s.tickerText, savedAt: Date.now() }].slice(-MAX_EDIT_HISTORY)
+        : s.editHistory;
+
       return {
         ...s,
         tickerText: text,
@@ -638,6 +910,50 @@ function App() {
         isApproved: isValid ? s.isApproved : false, // Auto-revoke if invalid
         status: 'editing' as const,
         editVersion: s.editVersion + 1,
+        editHistory,
+      };
+    }));
+  }, []);
+
+  /** Restore the most recent pre-edit snapshot. */
+  const undoTicker = useCallback((sourceId: string) => {
+    setStories(prev => prev.map(s => {
+      if (s.sourceId !== sourceId || s.editHistory.length === 0) return s;
+      const last = s.editHistory[s.editHistory.length - 1];
+      const { wordCount: wc, validationIssues, isValid } = evaluateTickerText(last.text);
+      return {
+        ...s,
+        tickerText: last.text,
+        wordCount: wc,
+        validationIssues,
+        isValid,
+        isApproved: isValid ? s.isApproved : false,
+        status: 'editing' as const,
+        editVersion: s.editVersion + 1,
+        editHistory: s.editHistory.slice(0, -1),
+      };
+    }));
+  }, []);
+
+  /** Restore the last generated text (the AI output), keeping the current text in the undo stack. */
+  const revertTicker = useCallback((sourceId: string) => {
+    setStories(prev => prev.map(s => {
+      if (s.sourceId !== sourceId || !s.originalTickerText || s.tickerText === s.originalTickerText) return s;
+      const { wordCount: wc, validationIssues, isValid } = evaluateTickerText(s.originalTickerText);
+      const currentText = s.tickerText;
+      const editHistory = s.tickerText.trim() && !s.editHistory.some(h => h.text === currentText)
+        ? [...s.editHistory, { text: currentText, savedAt: Date.now() }].slice(-MAX_EDIT_HISTORY)
+        : s.editHistory;
+      return {
+        ...s,
+        tickerText: s.originalTickerText,
+        wordCount: wc,
+        validationIssues,
+        isValid,
+        isApproved: isValid ? s.isApproved : false,
+        status: 'editing' as const,
+        editVersion: s.editVersion + 1,
+        editHistory,
       };
     }));
   }, []);
@@ -719,19 +1035,8 @@ function App() {
           };
         }
 
-        return {
-          ...s,
-          tickerText: result.ticker,
-          keyFact: result.key_fact,
-          reviewNote: result.review_note || undefined,
-          needsReview: result.needs_review,
-          wordCount: result.word_count,
-          validationIssues: result.validation_issues,
-          isValid: result.is_valid,
-          isDemo: result.is_demo,
-          status: 'generated' as const,
-          isApproved: false, // Never auto-approve
-        };
+        // Archives the previous ticker so all generated options stay available
+        return withGeneratedTicker(s, result);
       }));
 
       const successCount = response.results.filter(r => !r.error).length;
@@ -786,19 +1091,8 @@ function App() {
           return { ...s, status: 'error' as const, error: result.error };
         }
 
-        return {
-          ...s,
-          tickerText: result.ticker,
-          keyFact: result.key_fact,
-          reviewNote: result.review_note || undefined,
-          needsReview: result.needs_review,
-          wordCount: result.word_count,
-          validationIssues: result.validation_issues,
-          isValid: result.is_valid,
-          isDemo: result.is_demo,
-          status: 'generated' as const,
-          isApproved: false,
-        };
+        // Archives the previous ticker so all generated options stay available
+        return withGeneratedTicker(s, result);
       }));
     } catch (err: any) {
       setStories(prev => prev.map(s =>
@@ -806,6 +1100,83 @@ function App() {
       ));
     }
   }, [stories]);
+
+  // ── Ticker options (previously generated versions) ────────────────────
+
+  /** Swap a previously generated option back into the editor; the current text moves into the option list. */
+  const restoreTickerOption = useCallback((sourceId: string, optionId: string) => {
+    setStories(prev => prev.map(s => {
+      if (s.sourceId !== sourceId) return s;
+      const option = s.tickerOptions.find(o => o.id === optionId);
+      if (!option) return s;
+
+      let options = s.tickerOptions.filter(o => o.id !== optionId);
+      // Keep the current text available so switching between options is never lossy
+      const current = s.tickerText.trim();
+      if (current && current !== option.text.trim() && !options.some(o => o.text.trim() === current)) {
+        options = [...options, snapshotOption(s.sourceId, s, s.tickerVersion)];
+      }
+
+      // Snapshot the pre-switch text so the editor can undo this swap
+      const editHistory = current
+        ? [...s.editHistory, { text: s.tickerText, savedAt: Date.now() }].slice(-MAX_EDIT_HISTORY)
+        : s.editHistory;
+
+      return {
+        ...s,
+        tickerOptions: options,
+        tickerVersion: option.version,
+        tickerText: option.text,
+        keyFact: option.keyFact,
+        reviewNote: option.reviewNote,
+        needsReview: option.needsReview,
+        wordCount: option.wordCount,
+        validationIssues: option.validationIssues,
+        isValid: option.isValid,
+        isDemo: option.isDemo,
+        status: 'generated' as const,
+        isApproved: false, // Swapping versions revokes approval
+        originalTickerText: option.text,
+        editHistory,
+        editVersion: s.editVersion + 1,
+      };
+    }));
+  }, []);
+
+  /** Discard one archived option. */
+  const deleteTickerOption = useCallback((sourceId: string, optionId: string) => {
+    setStories(prev => prev.map(s =>
+      s.sourceId !== sourceId
+        ? s
+        : { ...s, tickerOptions: s.tickerOptions.filter(o => o.id !== optionId) }
+    ));
+  }, []);
+
+  // ── Tags / grouping ───────────────────────────────────────────────────
+
+  const setTags = useCallback((sourceId: string, tags: string[]) => {
+    setStories(prev => prev.map(s =>
+      s.sourceId === sourceId ? { ...s, tags } : s
+    ));
+  }, []);
+
+  // ── New session ───────────────────────────────────────────────────────
+
+  const newSession = useCallback(() => {
+    if (stories.length > 0 && !window.confirm('Start a new session? All current stories will be discarded (export first if you need them).')) return;
+    setStories([]);
+    setBatchId(`batch-${Date.now()}`);
+    setTagFilter(null);
+    clearSession();
+    setToast({ message: 'New session started', type: 'info' });
+  }, [stories.length]);
+
+  // ── Tag / category filter ─────────────────────────────────────────────
+
+  const allFilterLabels = Array.from(new Set([
+    ...stories.flatMap(s => s.tags),
+    ...stories.map(s => s.category).filter((c): c is string => !!c),
+  ]));
 
   // ── Export ─────────────────────────────────────────────────────────────
 
@@ -826,6 +1197,11 @@ function App() {
   const errorCount = stories.filter(s => s.status === 'error' || s.validationIssues.some(i => i.type === 'error')).length;
   const exportableCount = getExportableCount(stories);
   const pendingCount = stories.filter(s => s.status === 'pending').length;
+
+  // Filtered view — reorder still operates on the full ordered list
+  const visibleStories = tagFilter
+    ? stories.filter(s => s.tags.includes(tagFilter) || s.category === tagFilter)
+    : stories;
 
   return (
     <div className="min-h-screen bg-bg pb-16">
@@ -855,7 +1231,7 @@ function App() {
                   <span className="text-success flex items-center gap-1">
                     <Wifi size={13} />
                     <span className="hidden sm:inline">
-                      {geminiConfigured ? `Gemini (${modelName || 'live'})` : 'Demo Mode'}
+                      {geminiConfigured ? `${providerLabel} (${modelName || 'live'})` : 'Demo Mode'}
                     </span>
                   </span>
                 ) : (
@@ -957,7 +1333,7 @@ function App() {
             </div>
             <p className="text-xs text-secondary mt-4">
               {geminiConfigured
-                ? '✓ Gemini API connected — live ticker generation available'
+                ? `✓ ${providerLabel} connected — live ticker generation available`
                 : '⚡ Demo mode — prewritten sample tickers will be used'}
             </p>
           </div>
@@ -989,7 +1365,48 @@ function App() {
                 >
                   <FileText size={14} /> Load Samples
                 </button>
+                <button
+                  onClick={newSession}
+                  disabled={totalStories === 0}
+                  className="text-sm px-3 py-2 text-secondary hover:text-error hover:bg-error/10 rounded transition-fast flex items-center gap-1.5 disabled:opacity-30 disabled:cursor-not-allowed"
+                  title="Discard all stories and start a fresh session"
+                >
+                  <Trash2 size={14} /> New Session
+                </button>
               </div>
+
+              {/* Tag / category filter */}
+              {allFilterLabels.length > 0 && (
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  <button
+                    onClick={() => setTagFilter(null)}
+                    className={`text-xs px-2 py-1 rounded transition-fast border ${
+                      tagFilter === null
+                        ? 'bg-ink text-white border-ink'
+                        : 'border-muted text-secondary hover:text-ink hover:bg-muted'
+                    }`}
+                  >
+                    All ({totalStories})
+                  </button>
+                  {allFilterLabels.map(label => {
+                    const count = stories.filter(s => s.tags.includes(label) || s.category === label).length;
+                    const active = tagFilter === label;
+                    return (
+                      <button
+                        key={label}
+                        onClick={() => setTagFilter(active ? null : label)}
+                        className={`text-xs px-2 py-1 rounded transition-fast border font-mono ${
+                          active
+                            ? 'bg-accent text-white border-accent'
+                            : 'border-muted text-secondary hover:text-ink hover:bg-muted'
+                        }`}
+                      >
+                        {label} ({count})
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
 
               {!geminiConfigured && (
                 <span className="text-xs font-mono text-secondary bg-muted px-2 py-1 rounded">
@@ -999,22 +1416,40 @@ function App() {
             </div>
 
             {/* Story cards */}
-            <div className="space-y-3">
-              {stories.map((story, index) => (
-                <StoryCard
-                  key={story.sourceId}
-                  story={story}
-                  index={index}
-                  totalStories={totalStories}
-                  onEdit={editTicker}
-                  onApprove={approveTicker}
-                  onReject={rejectTicker}
-                  onRegenerate={regenerateOne}
-                  onMoveUp={(id) => moveStory(id, 'up')}
-                  onMoveDown={(id) => moveStory(id, 'down')}
-                />
-              ))}
-            </div>
+            {visibleStories.length === 0 ? (
+              <div className="text-sm text-secondary py-8 text-center">
+                No stories match <span className="font-mono font-medium">"{tagFilter}"</span>.
+                <button onClick={() => setTagFilter(null)} className="ml-2 text-accent hover:underline">
+                  Show all
+                </button>
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {visibleStories.map(story => {
+                  // Global position in the full list so reorder stays stable under filtering
+                  const index = stories.findIndex(s => s.sourceId === story.sourceId);
+                  return (
+                    <StoryCard
+                      key={story.sourceId}
+                      story={story}
+                      index={index}
+                      totalStories={totalStories}
+                      onEdit={editTicker}
+                      onApprove={approveTicker}
+                      onReject={rejectTicker}
+                      onRegenerate={regenerateOne}
+                      onRestoreOption={restoreTickerOption}
+                      onDeleteOption={deleteTickerOption}
+                      onUndo={undoTicker}
+                      onRevert={revertTicker}
+                      onTagsChange={setTags}
+                      onMoveUp={(id) => moveStory(id, 'up')}
+                      onMoveDown={(id) => moveStory(id, 'down')}
+                    />
+                  );
+                })}
+              </div>
+            )}
           </div>
         )}
       </main>

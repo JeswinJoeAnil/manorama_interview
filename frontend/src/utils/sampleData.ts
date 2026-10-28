@@ -3,9 +3,9 @@
  * Used for demo mode and sample data loading.
  */
 
-import type { Story } from '../types';
+import type { Story, StorySource } from '../types';
 
-export const SAMPLE_ANNOUNCEMENTS: Omit<Story, 'tickerText' | 'keyFact' | 'wordCount' | 'validationIssues' | 'isValid' | 'isApproved' | 'needsReview' | 'isDemo' | 'status' | 'editVersion'>[] = [
+export const SAMPLE_ANNOUNCEMENTS: StorySource[] = [
   {
     sourceId: 'sample-1',
     sourceTitle: 'ചേരാനല്ലൂർ അപകടം – ജയബാലകൃഷ്ണന്റെ മരണം',
@@ -52,6 +52,10 @@ export function createStoryFromSource(
     isDemo: false,
     status: 'pending',
     editVersion: 0,
+    tickerVersion: 0,
+    tickerOptions: [],
+    editHistory: [],
+    tags: [],
   };
 }
 

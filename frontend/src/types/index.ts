@@ -15,6 +15,44 @@ export interface ValidationIssue {
 
 // ── Story (the core domain object) ──────────────────────────────────────────
 
+/**
+ * A previously generated ticker kept so the editor can compare
+ * and switch between options instead of losing them on regenerate.
+ */
+export interface TickerOption {
+  /** Unique ID within the story's option list */
+  id: string;
+  /** Version number, unique within the story (1 = first generation) */
+  version: number;
+  /** Archived ticker text */
+  text: string;
+  /** Word count of the archived text */
+  wordCount: number;
+  /** Validation issues captured at generation time */
+  validationIssues: ValidationIssue[];
+  /** Whether the archived ticker passed all hard validation */
+  isValid: boolean;
+  /** Key fact the AI extracted for this generation */
+  keyFact: string;
+  /** Review note attached to this generation */
+  reviewNote?: string;
+  /** Whether this generation needed human review */
+  needsReview: boolean;
+  /** Whether this generation ran in demo mode */
+  isDemo: boolean;
+  /** When this option was archived (ms epoch) */
+  generatedAt: number;
+}
+
+/**
+ * A snapshot of a previous ticker text, taken before an edit overwrote it.
+ * Powers the per-story undo / revert controls.
+ */
+export interface EditSnapshot {
+  text: string;
+  savedAt: number;
+}
+
 export interface Story {
   /** Stable unique ID — never changes after creation */
   sourceId: string;
@@ -53,6 +91,16 @@ export interface Story {
   
   /** Version counter — incremented on each edit to prevent stale overwrites */
   editVersion: number;
+  /** Version number of the current ticker (0 = none yet, increments per generation) */
+  tickerVersion: number;
+  /** Previously generated tickers kept as selectable options */
+  tickerOptions: TickerOption[];
+  /** Ticker text as last generated — the revert target */
+  originalTickerText?: string;
+  /** Previous ticker texts so the editor can undo an edit */
+  editHistory: EditSnapshot[];
+  /** Editor-set tags for grouping / filtering (e.g. priority or topic) */
+  tags: string[];
 }
 
 export type StoryStatus = 
@@ -115,7 +163,10 @@ export interface BatchValidateResponse {
 
 export interface HealthResponse {
   status: string;
+  /** Kept for compatibility: true when the active AI provider is live. */
   gemini_configured: boolean;
+  /** Active provider id: 'gemini' or 'openai_compat'. */
+  provider: string;
   model: string;
 }
 
@@ -128,6 +179,8 @@ export interface ExportTicker {
   word_count: number;
   position: number;
   category?: string;
+  /** Editor-set tags, if any */
+  tags?: string[];
   approved: true;
 }
 
@@ -139,6 +192,14 @@ export interface ExportPayload {
 }
 
 // ── App State ───────────────────────────────────────────────────────────────
+
+/** A source announcement as passed into story creation (ID + text only). */
+export type StorySource = Omit<
+  Story,
+  | 'tickerText' | 'keyFact' | 'wordCount' | 'validationIssues' | 'isValid'
+  | 'isApproved' | 'needsReview' | 'isDemo' | 'status' | 'error' | 'editVersion'
+  | 'tickerVersion' | 'tickerOptions' | 'originalTickerText' | 'editHistory' | 'tags'
+>;
 
 export interface AppState {
   batchId: string;

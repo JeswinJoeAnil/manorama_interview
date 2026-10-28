@@ -6,14 +6,24 @@ from pydantic import BaseModel, Field
 from typing import Optional
 
 
-# ── Gemini structured output schema ──────────────────────────────────────────
+# ── AI provider structured output schemas ────────────────────────────────────
+# These Pydantic schemas are passed to the active AI provider (Gemini's
+# response_schema or OpenAI-compatible structured output) and reused to parse
+# and validate whatever the model returns. Providers are untrusted proposers.
 
-class GeminiTickerResponse(BaseModel):
-    """Schema returned by Gemini for a single ticker generation."""
+class TickerGenerationResponse(BaseModel):
+    """Schema the AI provider must return for a single ticker generation."""
     ticker: str = Field(default="", description="Generated ticker text (≤10 words)")
     key_fact: str = Field(default="", description="The central source-supported fact")
     review_note: Optional[str] = Field(default=None, description="Note if source is ambiguous")
     needs_review: bool = Field(default=False, description="True if source is ambiguous or sensitive")
+
+
+class VerificationResponse(BaseModel):
+    """Schema the AI provider must return for semantic drift verification."""
+    supported: bool = Field(default=False, description="True if the ticker faithfully represents the source")
+    issues: list[str] = Field(default=[], description="Specific factual concerns (empty if none)")
+    explanation: str = Field(default="", description="Brief explanation of the assessment")
 
 
 # ── API request schemas ──────────────────────────────────────────────────────
@@ -107,5 +117,7 @@ class VerificationResult(BaseModel):
 class HealthResponse(BaseModel):
     """Health check response."""
     status: str = "ok"
+    # Kept for frontend compatibility: true when the active provider is live.
     gemini_configured: bool = False
+    provider: str = ""  # "gemini" or "openai_compat"
     model: str = ""

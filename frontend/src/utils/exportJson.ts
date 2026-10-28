@@ -20,6 +20,7 @@ export function buildExportPayload(
     word_count: countWords(story.tickerText),
     position: index + 1,
     category: story.category,
+    tags: story.tags.length > 0 ? story.tags : undefined,
     approved: true as const,
   }));
   

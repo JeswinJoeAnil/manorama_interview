@@ -1,30 +1,33 @@
 """
-Gemini service — handles all AI generation and optional verification.
+Generation service — orchestration for all AI generation and optional verification.
 
 Key design decisions:
 - Each source is generated independently so one failure doesn't destroy the batch.
-- Structured JSON output is requested via Gemini's response_mime_type.
-- The model is treated as an untrusted proposer; all output is validated.
-- Demo mode returns fixed sample tickers without calling the API.
+- The active AI provider (Gemini or any OpenAI-compatible endpoint) is treated
+  as an untrusted proposer; all output is validated before use.
+- Structured JSON output is requested via the provider, then parsed into
+  Pydantic schemas shared across providers.
+- Demo mode returns fixed sample tickers without calling any API.
 """
 
 from __future__ import annotations
 
-import json
 import logging
-from typing import Optional
 
-# pyrefly: ignore[missing-import]
-from google import genai
-# pyrefly: ignore[missing-import]
-from google.genai import types
-
-from app.config import GEMINI_API_KEY, GEMINI_MODEL, MAX_WORDS
-from app.schemas import GeminiTickerResponse, TickerResult, ValidationIssue, VerificationResult
+from app.config import MAX_WORDS
+from app.schemas import (
+    TickerGenerationResponse,
+    TickerResult,
+    VerificationResponse,
+    VerificationResult,
+)
+from app.services import ai_providers
 from app.services.validation_service import validate_ticker
 from app.utils.word_count import count_words
 
-logger = logging.getLogger("newswire.gemini")
+logger = logging.getLogger("newswire.generation")
+
+MAX_OUTPUT_TOKENS = 4096
 
 # ── System prompt ────────────────────────────────────────────────────────────
 
@@ -57,8 +60,6 @@ OUTPUT FORMAT: Return valid JSON with these fields:
 """
 
 # ── Demo mode samples ────────────────────────────────────────────────────────
-
-DEMO_TICKERS: dict[str, TickerResult] = {}
 
 _DEMO_TICKER_1 = TickerResult(
     source_id="sample-1",
@@ -100,7 +101,7 @@ def get_demo_ticker(source_id: str, source_content: str, source_title: str | Non
             source_id=source_id,
             ticker="[Demo] Review required for this announcement",
             key_fact="Demo mode — no AI generation performed",
-            review_note="This is a demo ticker. Use live mode with a Gemini API key for real generation.",
+            review_note="This is a demo ticker. Configure an API key for the active AI provider to enable live generation.",
             needs_review=True,
             word_count=count_words("[Demo] Review required for this announcement"),
             is_demo=True,
@@ -113,21 +114,7 @@ def get_demo_ticker(source_id: str, source_content: str, source_title: str | Non
     return result
 
 
-# ── Live Gemini generation ───────────────────────────────────────────────────
-
-def _get_client() -> genai.Client:
-    """Create a Gemini client. Raises ValueError if no API key."""
-    if not GEMINI_API_KEY:
-        raise ValueError("GEMINI_API_KEY is not configured.")
-    # Explicit timeout so a slow/hanging API call can never freeze the server.
-    return genai.Client(api_key=GEMINI_API_KEY, http_options={"timeout": 100_000})
-
-
-# Gemini 3.x models "think" by default; low thinking keeps latency low while
-# the deterministic validation layer catches accuracy issues. Thinking tokens
-# share the output budget on some models, so the output cap is generous.
-_GENERATION_THINKING = types.ThinkingConfig(thinking_level="LOW")
-
+# ── Prompt building ──────────────────────────────────────────────────────────
 
 def _build_user_prompt(source_content: str, source_title: str | None = None) -> str:
     """Build the user prompt for ticker generation."""
@@ -139,6 +126,8 @@ def _build_user_prompt(source_content: str, source_title: str | None = None) -> 
     return "\n\n".join(parts)
 
 
+# ── Live AI generation ───────────────────────────────────────────────────────
+
 async def generate_ticker(
     source_id: str,
     source_content: str,
@@ -146,32 +135,22 @@ async def generate_ticker(
     source_category: str | None = None,
 ) -> TickerResult:
     """
-    Generate a ticker for a single source using Gemini.
+    Generate a ticker for a single source using the active AI provider.
     Validates the result and retries once if word count exceeds limit.
     """
-    if not GEMINI_API_KEY:
+    if not ai_providers.is_configured():
         return get_demo_ticker(source_id, source_content, source_title)
 
     try:
-        client = _get_client()
         user_prompt = _build_user_prompt(source_content, source_title)
 
-        # Async call — keeps the event loop free so batches truly run in parallel.
-        response = await client.aio.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=user_prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_INSTRUCTION,
-                response_mime_type="application/json",
-                response_schema=GeminiTickerResponse,
-                temperature=0.3,
-                max_output_tokens=4096,
-                thinking_config=_GENERATION_THINKING,
-            ),
+        parsed = await ai_providers.generate_structured(
+            system_instruction=SYSTEM_INSTRUCTION,
+            user_prompt=user_prompt,
+            schema=TickerGenerationResponse,
+            temperature=0.3,
+            max_output_tokens=MAX_OUTPUT_TOKENS,
         )
-
-        # Parse the response
-        parsed = _parse_gemini_response(response)
         if parsed is None:
             return TickerResult(
                 source_id=source_id,
@@ -190,20 +169,13 @@ async def generate_ticker(
                 f"You MUST use {MAX_WORDS} words or fewer. Count each word carefully."
             )
 
-            retry_response = await client.aio.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=retry_prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM_INSTRUCTION,
-                    response_mime_type="application/json",
-                    response_schema=GeminiTickerResponse,
-                    temperature=0.2,
-                    max_output_tokens=4096,
-                    thinking_config=_GENERATION_THINKING,
-                ),
+            retry_parsed = await ai_providers.generate_structured(
+                system_instruction=SYSTEM_INSTRUCTION,
+                user_prompt=retry_prompt,
+                schema=TickerGenerationResponse,
+                temperature=0.2,
+                max_output_tokens=MAX_OUTPUT_TOKENS,
             )
-
-            retry_parsed = _parse_gemini_response(retry_response)
             if retry_parsed and count_words(retry_parsed.ticker) <= MAX_WORDS:
                 parsed = retry_parsed
 
@@ -232,29 +204,12 @@ async def generate_ticker(
             needs_review=True,
         )
     except Exception as e:
-        logger.exception(f"Gemini generation failed for {source_id}")
+        logger.exception(f"Generation failed for {source_id}")
         return TickerResult(
             source_id=source_id,
             error=f"Generation failed: {type(e).__name__}: {str(e)[:200]}",
             needs_review=True,
         )
-
-
-def _parse_gemini_response(response) -> Optional[GeminiTickerResponse]:
-    """Safely parse Gemini's structured response."""
-    try:
-        if not response or not response.text:
-            return None
-
-        text = response.text.strip()
-        data = json.loads(text)
-        return GeminiTickerResponse(**data)
-    except (json.JSONDecodeError, TypeError, KeyError) as e:
-        logger.warning(f"Failed to parse Gemini response: {e}")
-        return None
-    except Exception as e:
-        logger.warning(f"Unexpected error parsing Gemini response: {e}")
-        return None
 
 
 # ── Optional semantic verification ───────────────────────────────────────────
@@ -289,8 +244,8 @@ async def verify_ticker(
     ticker_text: str,
     key_fact: str | None = None,
 ) -> VerificationResult:
-    """Optional semantic drift verification using a second Gemini call."""
-    if not GEMINI_API_KEY:
+    """Optional semantic drift verification using a second AI call."""
+    if not ai_providers.is_configured():
         return VerificationResult(
             source_id=source_id,
             supported=False,
@@ -299,25 +254,21 @@ async def verify_ticker(
         )
 
     try:
-        client = _get_client()
         prompt = VERIFICATION_PROMPT.format(
             source=source_content,
             ticker=ticker_text,
             key_fact=key_fact or "(not provided)",
         )
 
-        response = await client.aio.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0.1,
-                max_output_tokens=4096,
-                thinking_config=_GENERATION_THINKING,
-            ),
+        parsed = await ai_providers.generate_structured(
+            system_instruction=None,
+            user_prompt=prompt,
+            schema=VerificationResponse,
+            temperature=0.1,
+            max_output_tokens=MAX_OUTPUT_TOKENS,
         )
 
-        if not response or not response.text:
+        if parsed is None:
             return VerificationResult(
                 source_id=source_id,
                 supported=False,
@@ -325,12 +276,11 @@ async def verify_ticker(
                 error="No response from model.",
             )
 
-        data = json.loads(response.text.strip())
         return VerificationResult(
             source_id=source_id,
-            supported=data.get("supported", False),
-            issues=data.get("issues", []),
-            explanation=data.get("explanation", ""),
+            supported=parsed.supported,
+            issues=parsed.issues,
+            explanation=parsed.explanation,
         )
 
     except Exception as e:

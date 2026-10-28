@@ -7,7 +7,7 @@ import logging
 
 from fastapi import APIRouter, HTTPException
 
-from app.config import GEMINI_API_KEY, GEMINI_MODEL
+from app.config import AI_PROVIDER
 from app.schemas import (
     BatchValidateRequest,
     BatchValidateResponse,
@@ -19,7 +19,8 @@ from app.schemas import (
     VerifyTickerRequest,
     VerificationResult,
 )
-from app.services.gemini_service import generate_ticker, get_demo_ticker, verify_ticker
+from app.services import ai_providers
+from app.services.generation_service import generate_ticker, get_demo_ticker, verify_ticker
 from app.services.validation_service import validate_ticker
 from app.utils.word_count import count_words
 
@@ -30,18 +31,19 @@ router = APIRouter(prefix="/api")
 
 @router.get("/health", response_model=HealthResponse)
 async def health_check():
-    """Health check — reports whether Gemini is configured."""
+    """Health check — reports the active AI provider and whether it is configured."""
     return HealthResponse(
         status="ok",
-        gemini_configured=bool(GEMINI_API_KEY),
-        model=GEMINI_MODEL if GEMINI_API_KEY else "",
+        gemini_configured=ai_providers.is_configured(),
+        provider=AI_PROVIDER,
+        model=ai_providers.active_model_name() if ai_providers.is_configured() else "",
     )
 
 
 @router.post("/tickers/generate", response_model=GenerateResponse)
 async def generate_tickers(request: GenerateRequest):
     """Generate ticker candidates for one or more source announcements."""
-    is_demo = not bool(GEMINI_API_KEY)
+    is_demo = not ai_providers.is_configured()
 
     if is_demo:
         # Demo mode — return prewritten tickers
@@ -70,7 +72,7 @@ async def generate_tickers(request: GenerateRequest):
 
     return GenerateResponse(
         results=results,
-        model_used=GEMINI_MODEL,
+        model_used=ai_providers.active_model_name(),
         is_demo=False,
     )
 
