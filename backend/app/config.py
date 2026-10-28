@@ -7,9 +7,9 @@ load_dotenv()
 
 # Gemini AI
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
-# Note: gemini-2.5-flash is no longer available to new API keys.
-# Verified working models as of Oct 2026: gemini-3.8-flash, gemini-3.5-flash
-GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+# Note: gemini-2.5-flash is retired for new API keys.
+# Verified working models as of Oct 2026: gemini-3.5-flash (fast), gemini-3.8-flash (often overloaded)
+GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 
 # Ticker constraints
 MAX_WORDS: int = 10

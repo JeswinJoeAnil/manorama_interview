@@ -117,7 +117,14 @@ def _get_client() -> genai.Client:
     """Create a Gemini client. Raises ValueError if no API key."""
     if not GEMINI_API_KEY:
         raise ValueError("GEMINI_API_KEY is not configured.")
-    return genai.Client(api_key=GEMINI_API_KEY)
+    # Explicit timeout so a slow/hanging API call can never freeze the server.
+    return genai.Client(api_key=GEMINI_API_KEY, http_options={"timeout": 100_000})
+
+
+# Gemini 3.x models "think" by default; low thinking keeps latency low while
+# the deterministic validation layer catches accuracy issues. Thinking tokens
+# share the output budget on some models, so the output cap is generous.
+_GENERATION_THINKING = types.ThinkingConfig(thinking_level="LOW")
 
 
 def _build_user_prompt(source_content: str, source_title: str | None = None) -> str:
@@ -147,7 +154,8 @@ async def generate_ticker(
         client = _get_client()
         user_prompt = _build_user_prompt(source_content, source_title)
 
-        response = client.models.generate_content(
+        # Async call — keeps the event loop free so batches truly run in parallel.
+        response = await client.aio.models.generate_content(
             model=GEMINI_MODEL,
             contents=user_prompt,
             config=types.GenerateContentConfig(
@@ -155,7 +163,8 @@ async def generate_ticker(
                 response_mime_type="application/json",
                 response_schema=GeminiTickerResponse,
                 temperature=0.3,
-                max_output_tokens=512,
+                max_output_tokens=4096,
+                thinking_config=_GENERATION_THINKING,
             ),
         )
 
@@ -179,7 +188,7 @@ async def generate_ticker(
                 f"You MUST use {MAX_WORDS} words or fewer. Count each word carefully."
             )
 
-            retry_response = client.models.generate_content(
+            retry_response = await client.aio.models.generate_content(
                 model=GEMINI_MODEL,
                 contents=retry_prompt,
                 config=types.GenerateContentConfig(
@@ -187,7 +196,8 @@ async def generate_ticker(
                     response_mime_type="application/json",
                     response_schema=GeminiTickerResponse,
                     temperature=0.2,
-                    max_output_tokens=512,
+                    max_output_tokens=4096,
+                    thinking_config=_GENERATION_THINKING,
                 ),
             )
 
@@ -294,13 +304,14 @@ async def verify_ticker(
             key_fact=key_fact or "(not provided)",
         )
 
-        response = client.models.generate_content(
+        response = await client.aio.models.generate_content(
             model=GEMINI_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 temperature=0.1,
-                max_output_tokens=512,
+                max_output_tokens=4096,
+                thinking_config=_GENERATION_THINKING,
             ),
         )
 

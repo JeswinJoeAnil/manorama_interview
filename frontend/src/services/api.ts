@@ -10,7 +10,9 @@ import type {
   ValidateItem,
 } from '../types';
 
-const API_BASE = 'http://localhost:8000/api';
+// In dev, Vite proxies /api to the backend (see vite.config.ts).
+// In production, a reverse proxy in front of the app should do the same.
+const API_BASE = '/api';
 
 class ApiError extends Error {
   status: number;

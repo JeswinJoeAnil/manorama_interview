@@ -85,8 +85,10 @@ class TestValidateEndpoint:
 
 
 class TestGenerateEndpoint:
-    def test_generate_demo_mode(self):
-        """Without an API key, should return demo results."""
+    def test_generate_demo_mode(self, monkeypatch):
+        """Without an API key, should return demo results (no live API call)."""
+        import app.api.routes as routes
+        monkeypatch.setattr(routes, "GEMINI_API_KEY", "")  # force demo mode
         response = client.post("/api/tickers/generate", json={
             "sources": [{
                 "source_id": "test-1",
