@@ -14,7 +14,9 @@ import json
 import logging
 from typing import Optional
 
+# pyrefly: ignore[missing-import]
 from google import genai
+# pyrefly: ignore[missing-import]
 from google.genai import types
 
 from app.config import GEMINI_API_KEY, GEMINI_MODEL, MAX_WORDS
