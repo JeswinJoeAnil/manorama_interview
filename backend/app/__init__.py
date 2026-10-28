@@ -1,0 +1,1 @@
+# NEWSWIRE app package
